@@ -7,6 +7,8 @@ from collections import deque
 from datetime import datetime
 from queue import Queue
 import hashlib
+import atexit
+import signal
 
 # Определяем ОС
 IS_WINDOWS = sys.platform.startswith("win")
@@ -186,6 +188,32 @@ def cleanup_firewall_rules():
     elif IS_LINUX:
         print("Правила iptables будут сброшены после перезагрузки.")
 
+# ====== НАДЕЖНАЯ ОЧИСТКА ======
+
+def safe_cleanup():
+    """Потокобезопасная и идемпотентная очистка"""
+    if getattr(safe_cleanup, "already_run", False):
+        return
+    safe_cleanup.already_run = True
+
+    print("\nВыполняется очистка...")
+    cleanup_firewall_rules()
+
+# Регистрируем очистку при штатном завершении
+atexit.register(safe_cleanup)
+
+# Обработка сигналов (частично работает на Windows)
+def signal_handler(signum, frame):
+    print(f"\nПолучен сигнал {signum}. Завершение...")
+    stop_event.set()
+    safe_cleanup()
+    sys.exit(0)
+
+if hasattr(signal, 'SIGINT'):
+    signal.signal(signal.SIGINT, signal_handler)
+if hasattr(signal, 'SIGTERM'):
+    signal.signal(signal.SIGTERM, signal_handler)
+
 # ====== МЕНЮ ПОДТВЕРЖДЕНИЯ ======
 
 def confirmation_menu():
@@ -205,7 +233,10 @@ def confirmation_menu():
             print("[3] Заблокировать и не спрашивать больше (авто)")
             print("="*60)
 
-            choice = input("Ваш выбор (1/2/3): ").strip()
+            try:
+                choice = input("Ваш выбор (1/2/3): ").strip()
+            except EOFError:
+                choice = "2"
 
             if choice == "1":
                 block_ip(ip)
@@ -375,6 +406,13 @@ def packet_handler(packet):
 
 def main():
     global INTERACTIVE_MODE
+
+    # Режим ручной очистки
+    if "--cleanup" in sys.argv:
+        print("Режим ручной очистки запущен...")
+        cleanup_firewall_rules()
+        return
+
     print("Запуск анализатора сетевого трафика...")
     print("Режим: " + ("интерактивный (с подтверждением)" if INTERACTIVE_MODE else "автоматический"))
     if IS_WINDOWS:
@@ -382,15 +420,17 @@ def main():
     elif IS_LINUX:
         print("Запустите через sudo!")
 
-    print("\nНажмите Ctrl+C для остановки.\n")
+    print("\nУправление:")
+    print("   В PyCharm: нажмите Ctrl+F2 для остановки")
+    print("   В консоли: Ctrl+C\n")
 
     try:
         interfaces = get_if_list()
         print(f"Доступные интерфейсы: {interfaces}")
         if not INTERFACE and interfaces:
-            print(f"Будет использован интерфейс по умолчанию.")
-    except:
-        pass
+            print("Будет использован интерфейс по умолчанию.")
+    except Exception as e:
+        print(f"Не удалось получить список интерфейсов: {e}")
 
     menu_thread = threading.Thread(target=confirmation_menu, daemon=True)
     menu_thread.start()
@@ -400,25 +440,32 @@ def main():
     time.sleep(2)
 
     try:
-        sniff(
-            iface=INTERFACE,
-            prn=packet_handler,
-            store=False,
-            filter="ip"
-        )
+        print("Начало сниффинга...")
+        while not stop_event.is_set():
+            sniff(
+                iface=INTERFACE,
+                prn=packet_handler,
+                store=False,
+                filter="ip",
+                timeout=0.5,
+                stop_filter=lambda p: stop_event.is_set()
+            )
     except KeyboardInterrupt:
-        print("\nСниффинг остановлен.")
+        print("\nПолучен KeyboardInterrupt. Завершение...")
         stop_event.set()
-        cleanup_firewall_rules()
+        safe_cleanup()
+        return
     except PermissionError:
         if IS_WINDOWS:
             print("Запустите от имени Администратора!")
         else:
             print("Запустите через sudo!")
+        safe_cleanup()
+        return
     except Exception as e:
-        print(f"Ошибка: {e}")
-        stop_event.set()
-        cleanup_firewall_rules()
+        print(f"Неожиданная ошибка: {e}")
+        safe_cleanup()
+        return
 
 if __name__ == "__main__":
     main()
